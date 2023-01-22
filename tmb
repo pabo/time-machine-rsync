@@ -1,0 +1,137 @@
+#!/bin/sh
+
+# modified from https://samuelhewitt.com/blog/2018-06-05-time-machine-style-backups-with-rsync
+# also see http://www.mikerubel.org/computers/rsync_snapshots/
+
+# Installation / set up:
+# - copy to ~/bin/
+# - chmod +x
+# - crontab -e
+#   using rsync:
+#   */2 * * * *	~/bin/tmb ~/ remote-name:/backup_snapshots
+#
+#   locally, no rsync:
+#   0 * * * *	~/bin/tmb ~/ ~/tmbackups-downloads-test
+#
+# - remember to grant full disk access to cron and rsync (not sure which are necessary)
+# - ~/.tmbignore is directories or files to exclude from the snapshot
+#
+# What this script does:
+# - check to make sure target directory has backup enabled (to protect against mistaken overwrites!)
+# - check to make sure target directory has hourly backup folder
+# - get timestamp of previous backup
+# - create a new timestamped backup
+#   - `--link-dest` allows this backup to hardlink to the previous backup, preserving space
+#
+# hardlink TLDR:
+# - just another name for the same file
+# - editing the file, `cp`, and many operations will change the underlying file
+# - `rm` will not affect other copies of it
+# `ls -al` shows you the number of hardlinks!
+#
+# what the backup directory will look like:
+# TARGET_DIR/
+#   last_successful_timestamp
+#   backup_enabled
+#   hourly/
+#       2023-01-09T18-00-00/
+#       2023-01-09T19-00-00/
+#       2023-01-09T20-00-00/
+#   there may also be daily/ and weekly/ folders, which the server takes care of creating via rotation at the appropriate times
+
+function log {
+    echo "" >> $LOG_FILE
+    echo "##########################################" >> $LOG_FILE
+    echo "# $1" >> $LOG_FILE
+    echo "##########################################" >> $LOG_FILE
+}
+
+TIMESTAMP=`date "+%Y-%m-%dT%H-%M-%S"`
+TIMESTAMP_FILE="last_successful_timestamp"
+BACKUP_ENABLED_FILE="backup_enabled"
+IGNORE_FILE=~/.tmbignore
+LOG_DIR=~/.tmb_logs
+LOG_FILE=$LOG_DIR/$TIMESTAMP.log
+EXCLUDE_FILES=
+
+function print_usage {
+    echo "Usage: $0 SOURCE TARGET"
+}
+
+# arg checks
+if [ -z "$1" ]
+  then
+    print_usage
+    exit;
+fi
+
+if [ -z "$2" ]
+  then
+    print_usage
+    exit;
+fi
+
+SOURCE_DIR=$1
+TARGET_DIR=$2
+
+# make log dir if needed 
+mkdir -p $LOG_DIR &> /dev/null
+
+log "Ensuring backup is enabled on target"
+rsync --list-only $TARGET_DIR/$BACKUP_ENABLED_FILE >> $LOG_FILE 2>&1
+
+if ! [ "$?" = 0 ]; then
+    echo "target directory does not contain $BACKUP_ENABLED_FILE file. refusing to backup." >> $LOG_FILE
+    exit;
+fi
+
+log "Ensuring hourly folder exists on target"
+rsync --list-only $TARGET_DIR/hourly >> $LOG_FILE 2>&1
+
+if ! [ "$?" = 0 ]; then
+    echo "target directory does not contain hourly directory. refusing to backup." >> $LOG_FILE
+    exit;
+fi
+
+log "Reading $IGNORE_FILE"
+FILES_TO_IGNORE=`cat $IGNORE_FILE`
+EXCLUDE_OPTIONS=
+for file in $FILES_TO_IGNORE
+do
+    SAFE_FILENAME=`echo $file | tr -d -c ".-_[:alnum:]"`
+    EXCLUDE_OPTIONS="$EXCLUDE_OPTIONS --exclude $SAFE_FILENAME"
+done
+echo $EXCLUDE_OPTIONS >> $LOG_FILE
+
+# make other dirs if needed 
+#
+# This won't work over rsync. You could create temporary ones and rsync them over if you really wanted. For now we will
+# just require manual creation of these folders
+#
+# mkdir -p $TARGET_DIR/hourly &> /dev/null
+# mkdir -p $TARGET_DIR/daily &> /dev/null
+# mkdir -p $TARGET_DIR/weekly &> /dev/null
+
+log "Getting previous backup timestamp"
+rsync -v $TARGET_DIR/$TIMESTAMP_FILE /tmp/ >> $LOG_FILE 2>&1
+
+if [[ -e /tmp/$TIMESTAMP_FILE ]]; then
+    LAST_BACKUP_TIMESTAMP=`cat /tmp/$TIMESTAMP_FILE`
+fi
+
+# create new backup using rsync and output to log
+# NOTE: this had --delete. why?
+log "Creating backup"
+echo "rsync -aPq $EXCLUDE_OPTIONS --link-dest=../$LAST_BACKUP_TIMESTAMP $SOURCE_DIR/ $TARGET_DIR/hourly/$TIMESTAMP >> $LOG_FILE 2>&1" >> $LOG_FILE
+rsync -aPq $EXCLUDE_OPTIONS --link-dest=../$LAST_BACKUP_TIMESTAMP $SOURCE_DIR/ $TARGET_DIR/hourly/$TIMESTAMP >> $LOG_FILE 2>&1
+
+# check exit status to see if backup failed
+log "Checking status"
+if [ "$?" = 0 ]; then
+    # write success file
+    echo $TIMESTAMP > /tmp/$TIMESTAMP_FILE
+    rsync -aP /tmp/$TIMESTAMP_FILE $TARGET_DIR/ >> $LOG_FILE 2>&1
+    rm /tmp/$TIMESTAMP_FILE
+else
+    echo "Backup unsuccessful. rsync returned $?." >> $LOG_FILE 2>&1
+fi
